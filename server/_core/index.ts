@@ -42,12 +42,14 @@ async function startServer() {
     })
   );
 
-  // development mode uses Vite (dynamic import), production mode uses static files
   if (process.env.NODE_ENV === "development") {
-    const { setupVite } = await import("./vite");
+    // In dev, vite is loaded dynamically via a non-analyzable path
+    // so esbuild won't try to bundle it
+    const mod = "./vite";
+    const { setupVite } = await (Function('p', 'return import(p)')(mod));
     await setupVite(app, server);
   } else {
-    // Serve static files from the built frontend
+    // Serve pre-built static files
     const distPath = path.resolve(import.meta.dirname, "public");
     if (fs.existsSync(distPath)) {
       app.use(express.static(distPath));
@@ -55,7 +57,7 @@ async function startServer() {
         res.sendFile(path.resolve(distPath, "index.html"));
       });
     } else {
-      console.error(`Could not find the build directory: ${distPath}`);
+      console.error(`Build directory not found: ${distPath}`);
     }
   }
 
