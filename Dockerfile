@@ -15,10 +15,16 @@ COPY . .
 
 RUN pnpm run build
 
-# ── Stage 2: Production (Puppeteer's official image with Chrome) ───────────
-FROM ghcr.io/puppeteer/puppeteer:24.2.0 AS production
+# ── Stage 2: Production ────────────────────────────────────────────────────
+FROM node:20-bookworm AS production
 
-USER root
+# Install Chromium via apt (bookworm has all required libs)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends chromium \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PUPPETEER_SKIP_DOWNLOAD=true
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 
 RUN npm install -g pnpm@10.4.1
 
@@ -27,7 +33,6 @@ WORKDIR /app
 COPY package.json pnpm-lock.yaml ./
 COPY patches ./patches
 
-ENV PUPPETEER_SKIP_DOWNLOAD=true
 RUN pnpm install --no-frozen-lockfile --prod
 
 COPY --from=builder /app/dist ./dist
@@ -35,13 +40,9 @@ COPY --from=builder /app/dist ./dist
 COPY drizzle ./drizzle
 COPY drizzle.config.ts ./
 
-# Switch back to non-root user for security
-USER pptruser
-
 EXPOSE 3000
 
 ENV NODE_ENV=production
 ENV PORT=3000
-ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-stable
 
 CMD ["node", "dist/index.js"]
