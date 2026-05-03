@@ -9,7 +9,7 @@ COPY package.json pnpm-lock.yaml ./
 COPY patches ./patches
 
 ENV PUPPETEER_SKIP_DOWNLOAD=true
-RUN pnpm install --frozen-lockfile
+RUN pnpm install --no-frozen-lockfile
 
 COPY . .
 
@@ -28,7 +28,7 @@ COPY package.json pnpm-lock.yaml ./
 COPY patches ./patches
 
 ENV PUPPETEER_SKIP_DOWNLOAD=true
-RUN pnpm install --frozen-lockfile --prod
+RUN pnpm install --no-frozen-lockfile --prod
 
 COPY --from=builder /app/dist ./dist
 
