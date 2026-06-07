@@ -2,6 +2,10 @@ import puppeteer from "puppeteer";
 import { execSync } from "child_process";
 import fs from "fs";
 
+// ─── How many ads to collect ──────────────────────────────────────────────────
+// Bumped from 10 → 20 per brand. Scroll count is derived from this target.
+export const TARGET_ADS = 20;
+
 // Resolve Chrome executable
 function findChrome(): string {
   // 1. Environment variable (set in Docker / Railway)
@@ -37,7 +41,7 @@ function findChrome(): string {
 export interface AdData {
   id: string;
   libraryId: string;
-  body: string;
+  body: string; // full caption text
   startDate: string;
   daysRunning: number;
   cta: string;
@@ -49,7 +53,9 @@ export interface AdData {
 export interface BrandAdsData {
   brandName: string;
   pageId: string;
-  totalAds: number;
+  source: "meta" | "tiktok"; // which ad library this came from
+  totalAds: number; // how many ads we actually scraped (ads.length)
+  reportedTotal: number | null; // total the library reports for this page (null if unknown)
   ads: AdData[];
   platformCounts: Record<string, number>;
   videoCount: number;
@@ -98,29 +104,97 @@ export async function scrapeMetaAdsLibrary(url: string, brandName: string): Prom
     console.log(`[Scraper] Loading: ${url}`);
     await page.goto(url, { waitUntil: "networkidle2", timeout: 60000 });
 
-    // Scroll to load at least 10 ads
-    for (let i = 0; i < 6; i++) {
-      await page.evaluate(() => window.scrollBy(0, 2000));
-      await new Promise((r) => setTimeout(r, 1200));
+    // ── Read the "~N results" total the library reports, before scrolling ──
+    const reportedTotal = await page.evaluate(() => {
+      const text = document.body.innerText;
+      // Meta shows e.g. "~250 results", "1,2K results", "About 320 results", or Turkish "≈250 sonuç"
+      const patterns = [
+        /~?\s*([\d.,]+)\s+results?/i,
+        /([\d.,]+)\s+sonu[çc]/i,
+        /about\s+([\d.,]+)\s+results?/i,
+      ];
+      for (const re of patterns) {
+        const m = text.match(re);
+        if (m) {
+          const n = parseInt(m[1].replace(/[.,]/g, ""), 10);
+          if (!isNaN(n)) return n;
+        }
+      }
+      return null;
+    });
+    console.log(`[Scraper] Reported total for ${brandName}: ${reportedTotal ?? "unknown"}`);
+
+    // ── Scroll until we have enough ad blocks (target 20) or run out ──
+    let lastCount = 0;
+    let stagnant = 0;
+    const maxScrolls = 14;
+    for (let i = 0; i < maxScrolls; i++) {
+      await page.evaluate(() => window.scrollBy(0, 2500));
+      await new Promise((r) => setTimeout(r, 1300));
+
+      const count = await page.evaluate(() => {
+        const blocks = document.body.innerText.split(/\n(?=Active\n)/);
+        return blocks.filter((b) => b.includes("Library ID:")).length;
+      });
+
+      if (count >= TARGET_ADS) break;
+      // Stop early if scrolling no longer loads new ads (reached the end)
+      if (count === lastCount) {
+        stagnant++;
+        if (stagnant >= 3) break;
+      } else {
+        stagnant = 0;
+      }
+      lastCount = count;
     }
 
     // Extract all data via text parsing (most reliable approach)
-    const rawData = await page.evaluate(() => {
+    const rawData = await page.evaluate((targetAds) => {
       const text = document.body.innerText;
 
       // Split by "Active" markers to get individual ad blocks
       const blocks = text.split(/\n(?=Active\n)/);
-      const adBlocks = blocks.filter((b) => b.includes("Library ID:"));
+      const adBlocks = blocks.filter((b) => b.includes("Library ID:")).slice(0, targetAds);
 
       const ads: any[] = [];
       adBlocks.forEach((block, idx) => {
         const libMatch = block.match(/Library ID:\s*(\d+)/);
         const dateMatch = block.match(/Started running on\s+([^\n·]+)/);
+
+        // ── Full caption extraction ──
+        // After the "Sponsored" line, Meta renders the primary text (caption).
+        // Capture everything up to the first structural boundary instead of just one line.
+        let bodyText = "";
         const sponsoredIdx = block.indexOf("Sponsored\n");
-        const bodyText =
-          sponsoredIdx >= 0
-            ? block.substring(sponsoredIdx + 10, sponsoredIdx + 300).trim().split("\n")[0]
-            : "";
+        if (sponsoredIdx >= 0) {
+          const after = block.substring(sponsoredIdx + "Sponsored\n".length);
+          // Cut the caption at the first marker that signals the end of primary text.
+          const stopMarkers = [
+            "\nLibrary ID:",
+            "\nSee ad details",
+            "\nSee summary details",
+            "\nShop Now",
+            "\nLearn More",
+            "\nWatch More",
+            "\nSign Up",
+            "\nBook Now",
+            "\nDownload",
+            "\nGet Offer",
+            "\nContact Us",
+            "\nApply Now",
+            "\nSend Message",
+            "\nSee Menu",
+            "\nGet Quote",
+          ];
+          let cut = after.length;
+          for (const m of stopMarkers) {
+            const mi = after.indexOf(m);
+            if (mi >= 0 && mi < cut) cut = mi;
+          }
+          bodyText = after.substring(0, cut).trim();
+          // Collapse excessive blank lines but keep line breaks within the caption
+          bodyText = bodyText.replace(/\n{3,}/g, "\n\n").trim();
+        }
 
         // Extract CTA - common Meta Ads CTAs
         const ctaPatterns = [
@@ -140,13 +214,16 @@ export async function scrapeMetaAdsLibrary(url: string, brandName: string): Prom
           "Send Message",
           "Call Now",
         ];
-        let cta = "Shop Now";
+        let cta = "";
         for (const pattern of ctaPatterns) {
           if (block.includes(pattern)) {
             cta = pattern;
             break;
           }
         }
+        // Mark unknown CTAs explicitly instead of silently defaulting to "Shop Now",
+        // which previously inflated the CTA stats.
+        if (!cta) cta = "Belirsiz";
 
         // Detect platforms from platform icons text
         const platforms: string[] = [];
@@ -181,7 +258,7 @@ export async function scrapeMetaAdsLibrary(url: string, brandName: string): Prom
       });
 
       return ads;
-    });
+    }, TARGET_ADS);
 
     // Post-process: calculate days running, monthly trend, platform counts, CTA counts
     const ads: AdData[] = rawData.map((ad: any) => ({
@@ -228,7 +305,9 @@ export async function scrapeMetaAdsLibrary(url: string, brandName: string): Prom
     return {
       brandName,
       pageId,
+      source: "meta",
       totalAds: ads.length,
+      reportedTotal,
       ads,
       platformCounts,
       videoCount,

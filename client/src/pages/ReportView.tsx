@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { useParams } from "wouter";
 import { trpc } from "@/lib/trpc";
 import { Loader2, ArrowLeft, Copy, Share2 } from "lucide-react";
@@ -44,7 +45,9 @@ interface BrandData {
   url: string;
   brandName: string;
   pageId: string;
+  source: "meta" | "tiktok";
   totalAds: number;
+  reportedTotal: number | null;
   ads: AdData[];
   platformCounts: Record<string, number>;
   videoCount: number;
@@ -145,9 +148,15 @@ function ComparisonTab({ brands }: { brands: BrandData[] }) {
             <h4 className="font-bold text-slate-900 text-lg">{b.name}</h4>
             <div className="mt-3 space-y-1.5 text-sm text-slate-600">
               <div className="flex justify-between">
-                <span>Toplam Reklam</span>
+                <span>Analiz Edilen Reklam</span>
                 <span className="font-semibold text-slate-900">{b.totalAds}</span>
               </div>
+              {b.reportedTotal !== null && (
+                <div className="flex justify-between">
+                  <span>Kütüphane Toplamı</span>
+                  <span className="font-semibold text-slate-500">≈{b.reportedTotal}</span>
+                </div>
+              )}
               <div className="flex justify-between">
                 <span>Video</span>
                 <span className="font-semibold text-slate-900">{b.videoCount}</span>
@@ -278,7 +287,7 @@ function AdDurationTab({ brands }: { brands: BrandData[] }) {
       {brands.map((b) => {
         const topAds = [...b.ads]
           .sort((a, z) => z.daysRunning - a.daysRunning)
-          .slice(0, 10);
+          .slice(0, 20);
         return (
           <div key={b.name} className="bg-white rounded-xl p-5 shadow-sm border border-slate-100">
             <h4
@@ -414,7 +423,7 @@ function AdExamplesTab({ brands }: { brands: BrandData[] }) {
           </h4>
           {b.ads.length > 0 ? (
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-              {b.ads.slice(0, 10).map((ad) => (
+              {b.ads.slice(0, 20).map((ad) => (
                 <div
                   key={ad.id}
                   className="border border-slate-100 rounded-lg p-3 hover:border-slate-200 transition-colors"
@@ -525,7 +534,169 @@ function RecommendationsTab({ brands }: { brands: BrandData[] }) {
   );
 }
 
-// ─── Main Component ───────────────────────────────────────────────────────────
+// ─── Captions Tab — tüm caption'lar bir arada ────────────────────────────────
+function CaptionsTab({ brands }: { brands: BrandData[] }) {
+  const [activeBrand, setActiveBrand] = useState<string>("all");
+
+  const visibleBrands =
+    activeBrand === "all" ? brands : brands.filter((b) => b.name === activeBrand);
+
+  // Flatten all captions across the selected brand(s)
+  const allCaptions = visibleBrands.flatMap((b) =>
+    b.ads.map((ad) => ({
+      brandName: b.name,
+      color: b.color,
+      source: b.source,
+      libraryId: ad.libraryId,
+      libraryUrl: ad.libraryUrl,
+      body: ad.body,
+      startDate: ad.startDate,
+      cta: ad.cta,
+    }))
+  );
+
+  const copyOne = (text: string) => {
+    navigator.clipboard.writeText(text);
+    toast.success("Caption kopyalandı");
+  };
+
+  const copyAll = () => {
+    const text = allCaptions
+      .map((c) => `[${c.brandName}] ${c.body}`)
+      .join("\n\n———\n\n");
+    navigator.clipboard.writeText(text);
+    toast.success(`${allCaptions.length} caption kopyalandı`);
+  };
+
+  return (
+    <div className="space-y-4">
+      {/* Controls */}
+      <div className="bg-white rounded-xl p-4 shadow-sm border border-slate-100 flex flex-wrap items-center justify-between gap-3">
+        <div className="flex flex-wrap gap-2">
+          <button
+            onClick={() => setActiveBrand("all")}
+            className={`px-3 h-8 rounded-full text-xs font-medium border transition-colors ${
+              activeBrand === "all"
+                ? "bg-slate-900 text-white border-slate-900"
+                : "border-slate-200 text-slate-600 hover:bg-slate-50"
+            }`}
+          >
+            Tümü ({brands.reduce((s, b) => s + b.ads.length, 0)})
+          </button>
+          {brands.map((b) => (
+            <button
+              key={b.name}
+              onClick={() => setActiveBrand(b.name)}
+              className={`px-3 h-8 rounded-full text-xs font-medium border transition-colors flex items-center gap-1.5 ${
+                activeBrand === b.name
+                  ? "text-white border-transparent"
+                  : "border-slate-200 text-slate-600 hover:bg-slate-50"
+              }`}
+              style={activeBrand === b.name ? { backgroundColor: b.color } : {}}
+            >
+              <span
+                className="w-2 h-2 rounded-full inline-block"
+                style={{ backgroundColor: b.color }}
+              />
+              {b.name} ({b.ads.length})
+            </button>
+          ))}
+        </div>
+        <Button variant="outline" size="sm" onClick={copyAll} className="gap-1.5 h-8 text-xs">
+          <Copy className="w-3 h-3" />
+          Tümünü Kopyala
+        </Button>
+      </div>
+
+      {/* Caption grid */}
+      {allCaptions.length > 0 ? (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          {allCaptions.map((c, i) => (
+            <div
+              key={`${c.brandName}-${c.libraryId}-${i}`}
+              className="group bg-white rounded-xl border border-slate-100 p-4 shadow-sm hover:border-slate-200 transition-colors flex flex-col"
+            >
+              <div className="flex items-center justify-between gap-2 mb-2">
+                <span
+                  className="text-[11px] px-2 py-0.5 rounded-full text-white font-medium flex items-center gap-1.5"
+                  style={{ backgroundColor: c.color }}
+                >
+                  {c.brandName}
+                  <span className="opacity-70 uppercase">{c.source === "tiktok" ? "TT" : "Meta"}</span>
+                </span>
+                <div className="flex items-center gap-2 shrink-0">
+                  <span className="text-[11px] text-slate-400">{c.cta}</span>
+                  <button
+                    onClick={() => copyOne(c.body)}
+                    className="opacity-0 group-hover:opacity-100 transition-opacity text-slate-400 hover:text-slate-700"
+                    title="Kopyala"
+                  >
+                    <Copy className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              </div>
+              <p className="text-sm text-slate-700 whitespace-pre-line leading-relaxed flex-1">
+                {c.body}
+              </p>
+              <div className="flex items-center justify-between mt-3 pt-2 border-t border-slate-50 text-[11px] text-slate-400">
+                <span>{c.startDate || "—"}</span>
+                {c.libraryUrl ? (
+                  <a
+                    href={c.libraryUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-blue-500 hover:underline font-mono"
+                  >
+                    #{c.libraryId}
+                  </a>
+                ) : (
+                  <span className="font-mono">#{c.libraryId}</span>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="text-center text-slate-400 py-12 bg-white rounded-xl border border-slate-100">
+          Caption verisi yok
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Scrape coverage notice (reklam adedi uyuşmazlığı) ────────────────────────
+function ScrapeNotice({ brands }: { brands: BrandData[] }) {
+  const hasReported = brands.some((b) => b.reportedTotal !== null);
+  if (!hasReported) return null;
+
+  // Only warn when at least one brand's library reports more ads than we scraped.
+  const partial = brands.filter(
+    (b) => b.reportedTotal !== null && b.reportedTotal > b.totalAds
+  );
+  if (partial.length === 0) return null;
+
+  return (
+    <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800">
+      <p className="font-semibold mb-1">Reklam adedi hakkında</p>
+      <p className="leading-relaxed">
+        Raporlardaki sayılar, kütüphanenin gösterdiği toplam reklam sayısı değil,
+        analiz için çekilen örneklem adedidir (marka başına en fazla 20 reklam).
+      </p>
+      <ul className="mt-2 space-y-0.5">
+        {partial.map((b) => (
+          <li key={b.name} className="flex items-center gap-1.5">
+            <span className="w-2 h-2 rounded-full inline-block" style={{ backgroundColor: b.color }} />
+            <span className="font-medium">{b.name}:</span> {b.totalAds} reklam analiz edildi
+            <span className="text-amber-600"> · kütüphane ≈{b.reportedTotal} reklam bildiriyor</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+
 export default function ReportView() {
   const params = useParams<{ shareToken: string }>();
   const shareToken = params.shareToken;
@@ -570,7 +741,9 @@ export default function ReportView() {
     url: b.url || "",
     brandName: b.brandName || b.name || "Unknown",
     pageId: b.pageId || "",
+    source: b.source === "tiktok" ? "tiktok" : "meta",
     totalAds: b.totalAds || 0,
+    reportedTotal: typeof b.reportedTotal === "number" ? b.reportedTotal : null,
     ads: (b.ads || []).map((ad: any) => ({
       id: ad.id || "",
       libraryId: ad.libraryId || ad.id || "",
@@ -643,10 +816,12 @@ export default function ReportView() {
 
       {/* Tabs */}
       <main className="container py-6">
+        <ScrapeNotice brands={brands} />
         <Tabs defaultValue="comparison" className="w-full">
           <TabsList className="grid w-full grid-cols-4 lg:grid-cols-8 mb-6 bg-white border border-slate-200 p-1 rounded-lg h-auto gap-1">
             {[
               { value: "comparison", label: "Karşılaştırma" },
+              { value: "captions", label: "Caption'lar" },
               { value: "platforms", label: "Platformlar" },
               { value: "monthly", label: "Aylık Trend" },
               { value: "duration", label: "Süre" },
@@ -666,6 +841,9 @@ export default function ReportView() {
 
           <TabsContent value="comparison">
             <ComparisonTab brands={brands} />
+          </TabsContent>
+          <TabsContent value="captions">
+            <CaptionsTab brands={brands} />
           </TabsContent>
           <TabsContent value="platforms">
             <PlatformsTab brands={brands} />

@@ -2,6 +2,7 @@ import { z } from "zod";
 import { publicProcedure, router } from "../_core/trpc";
 import { createReport, getReportByShareToken, deleteReport } from "../db";
 import { scrapeMetaAdsLibrary } from "../services/metaAdsScraper";
+import { scrapeTikTokAdsLibrary } from "../services/tiktokAdsScraper";
 import { nanoid } from "nanoid";
 
 export const reportsRouter = router({
@@ -14,6 +15,9 @@ export const reportsRouter = router({
             name: z.string().min(1).max(255),
             url: z.string().url(),
             color: z.string().regex(/^#[0-9A-F]{6}$/i),
+            // Which ad library this URL points to. Defaults to meta for
+            // backward compatibility with existing clients.
+            source: z.enum(["meta", "tiktok"]).default("meta"),
           })
         ).min(1).max(3),
         reportName: z.string().min(1).max(255).optional(),
@@ -21,10 +25,12 @@ export const reportsRouter = router({
     )
     .mutation(async ({ input }) => {
       try {
-        // Scrape all brands in parallel
+        // Scrape all brands in parallel, routing to the correct scraper.
         const results = await Promise.all(
           input.brands.map((brand) =>
-            scrapeMetaAdsLibrary(brand.url, brand.name)
+            brand.source === "tiktok"
+              ? scrapeTikTokAdsLibrary(brand.url, brand.name)
+              : scrapeMetaAdsLibrary(brand.url, brand.name)
           )
         );
 
@@ -58,12 +64,14 @@ export const reportsRouter = router({
           brands: results.map((r) => ({
             name: r.brandName,
             adsCount: r.totalAds,
+            reportedTotal: r.reportedTotal,
+            source: r.source,
           })),
         };
       } catch (error) {
         console.error("[Reports] Scrape error:", error);
         throw new Error(
-          `Failed to scrape Meta Ads Library: ${error instanceof Error ? error.message : "Unknown error"}`
+          `Failed to scrape ads library: ${error instanceof Error ? error.message : "Unknown error"}`
         );
       }
     }),
