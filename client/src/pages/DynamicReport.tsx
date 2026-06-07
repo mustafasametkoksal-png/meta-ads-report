@@ -29,9 +29,11 @@ function removeToken(token: string) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(tokens));
 }
 
+type Source = "meta" | "tiktok";
+
 export default function DynamicReport() {
-  const [brands, setBrands] = useState<Array<{ name: string; url: string; color: string }>>([
-    { name: "", url: "", color: BRAND_COLORS[0] },
+  const [brands, setBrands] = useState<Array<{ name: string; url: string; color: string; source: Source }>>([
+    { name: "", url: "", color: BRAND_COLORS[0], source: "meta" },
   ]);
   const [isCreating, setIsCreating] = useState(false);
   const [savedTokens, setSavedTokens] = useState<string[]>([]);
@@ -53,7 +55,7 @@ export default function DynamicReport() {
       toast.success(
         `Rapor oluşturuldu! ${data.brands.map((b) => `${b.name}: ${b.adsCount} reklam`).join(", ")}`
       );
-      setBrands([{ name: "", url: "", color: BRAND_COLORS[0] }]);
+      setBrands([{ name: "", url: "", color: BRAND_COLORS[0], source: "meta" }]);
     },
     onError: (err) => {
       toast.error(`Hata: ${err.message}`);
@@ -71,7 +73,7 @@ export default function DynamicReport() {
 
   const handleAddBrand = () => {
     if (brands.length < 3) {
-      setBrands([...brands, { name: "", url: "", color: BRAND_COLORS[brands.length] }]);
+      setBrands([...brands, { name: "", url: "", color: BRAND_COLORS[brands.length], source: "meta" }]);
     } else {
       toast.error("Maksimum 3 marka ekleyebilirsiniz");
     }
@@ -97,9 +99,16 @@ export default function DynamicReport() {
       return;
     }
     for (const brand of brands) {
-      if (!brand.url.includes("facebook.com/ads/library")) {
-        toast.error(`"${brand.name}" için geçerli bir Meta Ads Library URL'si girin`);
-        return;
+      if (brand.source === "tiktok") {
+        if (!brand.url.includes("library.tiktok.com")) {
+          toast.error(`"${brand.name}" için geçerli bir TikTok Ads Library URL'si girin (library.tiktok.com)`);
+          return;
+        }
+      } else {
+        if (!brand.url.includes("facebook.com/ads/library")) {
+          toast.error(`"${brand.name}" için geçerli bir Meta Ads Library URL'si girin`);
+          return;
+        }
       }
     }
     setIsCreating(true);
@@ -130,7 +139,7 @@ export default function DynamicReport() {
             Meta Ads Raporu
           </h1>
           <p className="text-slate-500 mt-1 text-sm">
-            Meta Ads Library URL'lerini ekleyerek otomatik karşılaştırma raporu oluşturun
+            Meta ve TikTok Ads Library URL'lerini ekleyerek otomatik karşılaştırma raporu oluşturun
           </p>
         </div>
 
@@ -188,11 +197,43 @@ export default function DynamicReport() {
                   </div>
                 </div>
                 <div>
+                  <label className="text-xs font-medium text-slate-600 mb-1 block">Reklam Kütüphanesi</label>
+                  <div className="flex gap-2">
+                    {([
+                      { key: "meta", label: "Meta (Facebook/Instagram)" },
+                      { key: "tiktok", label: "TikTok" },
+                    ] as const).map((opt) => (
+                      <button
+                        key={opt.key}
+                        type="button"
+                        onClick={() => handleBrandChange(index, "source", opt.key)}
+                        className={`flex-1 h-9 rounded-md border text-xs font-medium transition-colors ${
+                          brand.source === opt.key
+                            ? "border-emerald-500 bg-emerald-50 text-emerald-700"
+                            : "border-slate-200 text-slate-500 hover:bg-slate-50"
+                        }`}
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
+                  {brand.source === "tiktok" && (
+                    <p className="text-[11px] text-amber-600 mt-1.5 leading-snug">
+                      Not: TikTok Ads Library yalnızca AB'de gösterilen reklamları kapsar.
+                      Markanın Türkiye/global kampanyaları görünmeyebilir.
+                    </p>
+                  )}
+                </div>
+                <div>
                   <label className="text-xs font-medium text-slate-600 mb-1 block">
-                    Meta Ads Library URL
+                    {brand.source === "tiktok" ? "TikTok Ads Library URL" : "Meta Ads Library URL"}
                   </label>
                   <Input
-                    placeholder="https://www.facebook.com/ads/library/?...&view_all_page_id=..."
+                    placeholder={
+                      brand.source === "tiktok"
+                        ? "https://library.tiktok.com/ads?...&advertiser_business_ids=..."
+                        : "https://www.facebook.com/ads/library/?...&view_all_page_id=..."
+                    }
                     value={brand.url}
                     onChange={(e) => handleBrandChange(index, "url", e.target.value)}
                     className="h-9 text-xs font-mono"
