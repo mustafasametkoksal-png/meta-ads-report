@@ -7,15 +7,35 @@ import { TARGET_ADS } from "./metaAdsScraper";
 /**
  * TikTok Commercial Content Library scraper.
  *
- * This targets TikTok's transparency archive (the closest analogue to Meta Ads
- * Library): https://library.tiktok.com/ads — which lists the paid ads an
- * advertiser has run. NOTE: this archive only covers ads SHOWN IN THE EU, so a
- * brand's Turkey/global campaigns may not appear here. That caveat is surfaced
- * to the user in the report UI.
+ * Targets https://library.tiktok.com/ads — TikTok's ad transparency archive
+ * (the closest analogue to Meta Ads Library). NOTE: this archive only covers
+ * ads SHOWN IN THE EU, so a brand's non-EU campaigns may not appear. That
+ * caveat is surfaced to the user in the report UI.
+ *
+ * ── How it works (verified against the live site) ──
+ * The page is a client-side React app. Ad data is loaded via an authenticated
+ * POST to `/api/v1/search` whose request carries a generated `X-CCL-STR`
+ * anti-bot/signature header. That header is produced by the page's own JS, so
+ * the API cannot be called directly from a plain server-side request (it
+ * returns 421). Instead we drive the real page in a headless browser and let
+ * IT make the signed calls: we install a lightweight XHR interceptor, click the
+ * "View more" button to trigger the page's own paginated API calls, and read
+ * the JSON responses the page receives.
+ *
+ * The search API response items contain everything we need:
+ *   - id                → ad id
+ *   - title             → AD CAPTION (this is the caption text)
+ *   - name              → advertiser name
+ *   - first_shown_date  → epoch ms
+ *   - last_shown_date   → epoch ms
+ *   - videos[]          → non-empty ⇒ video ad, empty ⇒ image ad
+ *   - image_urls[]      → thumbnail(s)
+ * and the envelope carries `total` (the library's reported total) and
+ * `has_more`. No per-ad detail page visit is needed.
  *
  * Returns the same BrandAdsData shape as the Meta scraper so the report UI can
- * render both sources uniformly. Some Meta-specific fields (Messenger/Audience
- * Network platform counts) are simply left at zero for TikTok.
+ * render both sources uniformly. Meta-only platform buckets (Messenger /
+ * Audience Network) are left at zero for TikTok.
  */
 
 function findChrome(): string {
@@ -39,29 +59,41 @@ function findChrome(): string {
   throw new Error("Chrome/Chromium not found. Set PUPPETEER_EXECUTABLE_PATH or install chromium.");
 }
 
-function parseDateToMs(dateStr: string): number {
-  const cleaned = dateStr.replace(/·.*$/, "").trim();
-  const d = new Date(cleaned);
-  return isNaN(d.getTime()) ? Date.now() : d.getTime();
-}
-
-function daysSince(dateStr: string): number {
-  const ms = parseDateToMs(dateStr);
-  return Math.max(0, Math.floor((Date.now() - ms) / (1000 * 60 * 60 * 24)));
-}
-
-/** Pull an advertiser/page identifier out of common TikTok library URL shapes. */
+/** Pull the advertiser business id out of a TikTok library URL (for pageId). */
 function extractTikTokId(url: string): string {
   const patterns = [
+    /adv_biz_ids=([^&]+)/i,
     /advertiser_business_ids=([^&]+)/i,
     /advertiser_id=([^&]+)/i,
-    /[?&]id=([^&]+)/i,
   ];
   for (const re of patterns) {
     const m = url.match(re);
     if (m) return decodeURIComponent(m[1]);
   }
   return "";
+}
+
+/** Shape of an ad item as captured from the page's /api/v1/search responses. */
+interface RawTikTokAd {
+  id: string;
+  caption: string;
+  advertiser: string;
+  isVideo: boolean;
+  first: number | null; // epoch ms
+  last: number | null; // epoch ms
+}
+
+function daysSinceMs(ms: number | null): number {
+  if (!ms) return 0;
+  return Math.max(0, Math.floor((Date.now() - ms) / (1000 * 60 * 60 * 24)));
+}
+
+function msToDateString(ms: number | null): string {
+  if (!ms) return "";
+  const d = new Date(ms);
+  if (isNaN(d.getTime())) return "";
+  // Match the human format used elsewhere, e.g. "20 Apr 2026"
+  return d.toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
 }
 
 export async function scrapeTikTokAdsLibrary(url: string, brandName: string): Promise<BrandAdsData> {
@@ -78,132 +110,105 @@ export async function scrapeTikTokAdsLibrary(url: string, brandName: string): Pr
     });
 
     const page = await browser.newPage();
-    await page.setViewport({ width: 1280, height: 900 });
+    await page.setViewport({ width: 1280, height: 1000 });
     await page.setUserAgent(
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     );
 
+    // Install the XHR interceptor BEFORE any navigation so we capture the very
+    // first /api/v1/search response too. We accumulate ad items keyed by id and
+    // remember the reported total from the response envelope.
+    await page.evaluateOnNewDocument(() => {
+      (window as any).__ttAds = {};
+      (window as any).__ttTotal = null;
+      const OrigOpen = XMLHttpRequest.prototype.open;
+      const OrigSend = XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.open = function (this: any, method: string, u: string, ...rest: any[]) {
+        this.__ttUrl = u;
+        // @ts-ignore
+        return OrigOpen.call(this, method, u, ...rest);
+      };
+      XMLHttpRequest.prototype.send = function (this: any, body?: any) {
+        if (/\/api\/v1\/search/.test(this.__ttUrl || "")) {
+          this.addEventListener("load", () => {
+            try {
+              const j = JSON.parse(this.responseText);
+              if (j && Array.isArray(j.data)) {
+                j.data.forEach((d: any) => {
+                  (window as any).__ttAds[d.id] = {
+                    id: d.id,
+                    caption: d.title || "",
+                    advertiser: d.name || "",
+                    isVideo: Array.isArray(d.videos) && d.videos.length > 0,
+                    first: d.first_shown_date || null,
+                    last: d.last_shown_date || null,
+                  };
+                });
+                if (typeof j.total === "number") (window as any).__ttTotal = j.total;
+              }
+            } catch (e) {
+              /* ignore non-JSON */
+            }
+          });
+        }
+        return OrigSend.call(this, body);
+      };
+    });
+
     console.log(`[TikTok Scraper] Loading: ${url}`);
     await page.goto(url, { waitUntil: "networkidle2", timeout: 60000 });
-    // TikTok's library hydrates content client-side; give it a beat.
-    await new Promise((r) => setTimeout(r, 3500));
+    // Let the initial search call resolve.
+    await new Promise((r) => setTimeout(r, 4000));
 
-    // Reported total ("N results" / "N sonuç")
-    const reportedTotal = await page.evaluate(() => {
-      const text = document.body.innerText;
-      const patterns = [/([\d.,]+)\s+results?/i, /([\d.,]+)\s+ads?/i, /([\d.,]+)\s+sonu[çc]/i];
-      for (const re of patterns) {
-        const m = text.match(re);
-        if (m) {
-          const n = parseInt(m[1].replace(/[.,]/g, ""), 10);
-          if (!isNaN(n)) return n;
-        }
-      }
-      return null;
-    });
-    console.log(`[TikTok Scraper] Reported total for ${brandName}: ${reportedTotal ?? "unknown"}`);
-
-    // Scroll to load cards until we hit the target or stop making progress.
-    let lastCount = 0;
+    // Click "View more" until we have at least TARGET_ADS ads captured, or the
+    // button disappears / stops yielding new ads.
     let stagnant = 0;
-    for (let i = 0; i < 16; i++) {
-      await page.evaluate(() => window.scrollBy(0, 2500));
-      await new Promise((r) => setTimeout(r, 1500));
-      const count = await page.evaluate(() => {
-        // Card detection: TikTok library cards expose "See details" / ad metadata.
-        // Count anchors/containers that look like individual ad cards.
-        const cards = document.querySelectorAll(
-          "[class*='adCard'], [class*='ad-card'], [data-testid*='ad'], a[href*='/ad/']"
-        );
-        if (cards.length) return cards.length;
-        // Fallback: count "See details" occurrences in text.
-        return (document.body.innerText.match(/See details|Detayları gör/gi) || []).length;
-      });
+    for (let i = 0; i < 6; i++) {
+      const count = await page.evaluate(() => Object.keys((window as any).__ttAds || {}).length);
       if (count >= TARGET_ADS) break;
-      if (count === lastCount) {
+
+      const clicked = await page.evaluate(() => {
+        const btn = document.querySelector("div.loading_more") as HTMLElement | null;
+        if (!btn) return false;
+        btn.scrollIntoView();
+        btn.click();
+        return true;
+      });
+      if (!clicked) break;
+
+      await new Promise((r) => setTimeout(r, 2800));
+
+      const after = await page.evaluate(() => Object.keys((window as any).__ttAds || {}).length);
+      if (after === count) {
         stagnant++;
-        if (stagnant >= 3) break;
+        if (stagnant >= 2) break;
       } else {
         stagnant = 0;
       }
-      lastCount = count;
     }
 
-    // Extract structured data from cards. We try DOM selectors first and fall
-    // back to text parsing, mirroring the Meta scraper's resilience approach.
-    const rawData = await page.evaluate((targetAds) => {
-      const out: any[] = [];
+    // Pull captured ads + reported total out of the page.
+    const { rawAds, reportedTotal } = await page.evaluate(() => {
+      return {
+        rawAds: Object.values((window as any).__ttAds || {}),
+        reportedTotal: (window as any).__ttTotal,
+      };
+    });
 
-      const cardEls = Array.from(
-        document.querySelectorAll(
-          "[class*='adCard'], [class*='ad-card'], [data-testid*='ad']"
-        )
-      ).slice(0, targetAds);
+    await browser.close();
 
-      const grabText = (el: Element | null) => (el ? (el.textContent || "").trim() : "");
+    const limited = (rawAds as RawTikTokAd[]).slice(0, TARGET_ADS);
 
-      cardEls.forEach((card, idx) => {
-        const cardText = (card as HTMLElement).innerText || "";
-
-        // Caption: longest meaningful text node in the card.
-        const candidates = cardText
-          .split("\n")
-          .map((s) => s.trim())
-          .filter((s) => s.length > 0);
-        const caption =
-          candidates.sort((a, b) => b.length - a.length)[0] || `Ad ${idx + 1}`;
-
-        // First-shown date
-        const dateMatch = cardText.match(
-          /(?:First shown|İlk gösterim|First seen)[:\s]*([0-9]{1,2}\s+\w+\s+[0-9]{4}|\w+ [0-9]{1,2}, [0-9]{4})/i
-        );
-        const startDate = dateMatch ? dateMatch[1].trim() : "";
-
-        // Ad detail link → id
-        const link = card.querySelector("a[href*='/ad/']") as HTMLAnchorElement | null;
-        const href = link?.href || "";
-        const idMatch = href.match(/\/ad\/([^/?]+)/);
-        const adId = idMatch ? idMatch[1] : `tt_${idx}`;
-
-        out.push({
-          id: `ad_${idx}`,
-          libraryId: adId,
-          body: caption,
-          startDate,
-          cta: "Belirsiz", // TikTok library rarely exposes a discrete CTA label
-          platforms: ["TikTok"],
-          format: "Video", // TikTok ads are overwhelmingly video
-          libraryUrl: href || "https://library.tiktok.com/ads",
-        });
-      });
-
-      // Fallback: if no cards matched, segment by "See details".
-      if (out.length === 0) {
-        const text = document.body.innerText;
-        const segs = text.split(/(?=See details|Detayları gör)/i).slice(0, targetAds);
-        segs.forEach((seg, idx) => {
-          const lines = seg.split("\n").map((s) => s.trim()).filter(Boolean);
-          const caption = lines.sort((a, b) => b.length - a.length)[0] || `Ad ${idx + 1}`;
-          const dateMatch = seg.match(/([0-9]{1,2}\s+\w+\s+[0-9]{4})/);
-          out.push({
-            id: `ad_${idx}`,
-            libraryId: `tt_${idx}`,
-            body: caption,
-            startDate: dateMatch ? dateMatch[1] : "",
-            cta: "Belirsiz",
-            platforms: ["TikTok"],
-            format: "Video",
-            libraryUrl: "https://library.tiktok.com/ads",
-          });
-        });
-      }
-
-      return out;
-    }, TARGET_ADS);
-
-    const ads: AdData[] = rawData.map((ad: any) => ({
-      ...ad,
-      daysRunning: ad.startDate ? daysSince(ad.startDate) : 0,
+    const ads: AdData[] = limited.map((ad, idx) => ({
+      id: `ad_${idx}`,
+      libraryId: ad.id,
+      body: ad.caption || `Ad ${idx + 1}`,
+      startDate: msToDateString(ad.first),
+      daysRunning: daysSinceMs(ad.first),
+      cta: "Belirsiz", // TikTok library doesn't expose a discrete CTA label
+      platforms: ["TikTok"],
+      format: ad.isVideo ? "Video" : "Image/Carousel",
+      libraryUrl: `https://library.tiktok.com/ads/detail/?ad_id=${ad.id}`,
     }));
 
     const platformCounts: Record<string, number> = {
@@ -223,22 +228,20 @@ export async function scrapeTikTokAdsLibrary(url: string, brandName: string): Pr
     const staticCount = ads.length - videoCount;
 
     const monthlyTrend: Record<string, number> = {};
-    ads.forEach((ad) => {
-      if (!ad.startDate) return;
-      const d = new Date(parseDateToMs(ad.startDate));
+    limited.forEach((ad) => {
+      if (!ad.first) return;
+      const d = new Date(ad.first);
       if (isNaN(d.getTime())) return;
       const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
       monthlyTrend[key] = (monthlyTrend[key] || 0) + 1;
     });
-
-    await browser.close();
 
     return {
       brandName,
       pageId,
       source: "tiktok",
       totalAds: ads.length,
-      reportedTotal,
+      reportedTotal: typeof reportedTotal === "number" ? reportedTotal : null,
       ads,
       platformCounts,
       videoCount,
