@@ -89,6 +89,50 @@ describe("parseAdCardText", () => {
     expect(parseAdCardText(card, 0).cta).toBe("Belirsiz");
   });
 
+  it("matches CTA case-insensitively and canonicalizes (Shop now -> Shop Now)", () => {
+    const card = [
+      "Active", "Library ID: 222", "Started running on 1 Jun 2026",
+      "Brand", "Sponsored",
+      "From the pitch to the street.",
+      "ADIDAS.CO.UK", "Born from sport", "Shop now",
+    ].join("\n");
+    const ad = parseAdCardText(card, 0);
+    expect(ad.cta).toBe("Shop Now");
+  });
+
+  it("recognizes app-install CTAs (Install now)", () => {
+    const card = [
+      "Active", "Library ID: 333", "Started running on 1 Jun 2026",
+      "Puma", "Sponsored",
+      "Early Access and much more are waiting for you on the PUMA App",
+      "PLAY.GOOGLE.COM", "PUMA APP", "Install now",
+    ].join("\n");
+    const ad = parseAdCardText(card, 0);
+    expect(ad.cta).toBe("Install Now");
+    // caption must stop at the link-card domain line
+    expect(ad.body).toBe("Early Access and much more are waiting for you on the PUMA App");
+    expect(ad.body).not.toContain("PLAY.GOOGLE.COM");
+    expect(ad.body).not.toContain("PUMA APP");
+  });
+
+  it("cuts caption at video scrubber line and flags Video format", () => {
+    const card = [
+      "Active", "Library ID: 444", "Started running on 1 Jun 2026",
+      "Originals", "Sponsored",
+      "Do terreno de jogo para as ruas.",
+      "0:00 / 0:06", "ADIDAS.PT", "Shop now",
+    ].join("\n");
+    const ad = parseAdCardText(card, 0);
+    expect(ad.body).toBe("Do terreno de jogo para as ruas.");
+    expect(ad.format).toBe("Video");
+    expect(ad.cta).toBe("Shop Now");
+  });
+
+  it("reports no platforms when the card text reveals none (no fabricated 50/50)", () => {
+    const card = "Active\nLibrary ID: 555\nStarted running on 1 Jan 2026\nSponsored\nMerhaba";
+    expect(parseAdCardText(card, 0).platforms).toEqual([]);
+  });
+
   it("detects video format from timestamp", () => {
     const card = enCard + "\n0:00 / 0:23";
     expect(parseAdCardText(card, 0).format).toBe("Video");

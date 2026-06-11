@@ -49,6 +49,25 @@ export function registerPdfRoute(app: Express, getPort: () => number) {
       // Give Recharts time to mount + animate into final positions
       await new Promise((r) => setTimeout(r, 2800));
 
+      // Walk the full page so lazy-loaded creatives & below-the-fold content
+      // actually render before printing (page.pdf does not trigger lazy load)
+      await page.evaluate(async () => {
+        await new Promise<void>((resolve) => {
+          let y = 0;
+          const step = () => {
+            y += 1200;
+            window.scrollTo(0, y);
+            if (y < document.body.scrollHeight) setTimeout(step, 120);
+            else {
+              window.scrollTo(0, 0);
+              resolve();
+            }
+          };
+          step();
+        });
+      });
+      await new Promise((r) => setTimeout(r, 800));
+
       const pdf = await page.pdf({
         format: "A4",
         printBackground: true,

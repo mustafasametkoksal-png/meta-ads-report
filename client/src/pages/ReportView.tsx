@@ -454,7 +454,6 @@ function AdExamplesTab({ brands }: { brands: BrandData[] }) {
                       <img
                         src={ad.thumbnail}
                         alt={`${b.name} reklam kreatifi`}
-                        loading="lazy"
                         className="w-full max-h-72 object-contain object-top rounded-md mb-3 bg-slate-50 border border-slate-100"
                       />
                     </a>

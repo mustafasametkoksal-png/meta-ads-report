@@ -110,26 +110,60 @@ function extractPageId(url: string): string {
   return match ? match[1] : "";
 }
 
-// ─── CTA catalogue (EN + TR labels as rendered by Meta) ───────────────────────
-const CTA_PATTERNS = [
-  "Shop Now", "Watch More", "Learn More", "Sign Up", "Book Now", "Download",
-  "Get Offer", "Contact Us", "Apply Now", "Subscribe", "Get Quote",
-  "Request Time", "See Menu", "Send Message", "Call Now", "Order Now",
-  "Get Directions", "Play Game",
+// ─── CTA catalogue (EN + TR, canonical labels) ────────────────────────────────
+const CTA_LABELS = [
+  "Shop Now", "Install Now", "Learn More", "Watch More", "Watch Now", "Sign Up",
+  "Book Now", "Download", "Get Offer", "Contact Us", "Apply Now", "Subscribe",
+  "Get Quote", "Request Time", "See Menu", "Send Message", "Call Now",
+  "Order Now", "Get Directions", "Play Game", "Listen Now", "Read More",
+  "Use App", "Get App", "Donate Now", "Get Tickets", "Open Link",
   // Turkish UI labels
-  "Şimdi satın al", "Alışveriş yap", "Daha fazla bilgi al", "Daha fazlasını izle",
-  "Kaydol", "Rezervasyon yap", "İndir", "Teklif al", "Bize ulaşın",
-  "Başvur", "Abone ol", "Fiyat teklifi al", "Menüye bak", "Mesaj gönder",
-  "Şimdi ara", "Sipariş ver", "Yol tarifi al",
+  "Şimdi satın al", "Şimdi yükle", "Alışveriş yap", "Daha fazla bilgi al",
+  "Daha fazlasını izle", "Kaydol", "Rezervasyon yap", "İndir", "Teklif al",
+  "Bize ulaşın", "Başvur", "Abone ol", "Fiyat teklifi al", "Menüye bak",
+  "Mesaj gönder", "Şimdi ara", "Sipariş ver", "Yol tarifi al", "Uygulamayı kullan",
 ];
 
-// Markers that signal the end of the primary text (caption)
-const STOP_MARKERS = [
-  "\nLibrary ID:", "\nKitaplık Kimliği", "\nKimlik:",
-  "\nSee ad details", "\nSee summary details",
-  "\nReklam ayrıntılarını gör", "\nÖzet ayrıntılarını gör",
-  ...CTA_PATTERNS.map((c) => `\n${c}`),
+// Case-insensitive lookup (both EN and TR lowercasing to handle İ/i correctly)
+const CTA_LOOKUP = new Map<string, string>();
+for (const label of CTA_LABELS) {
+  CTA_LOOKUP.set(label.toLowerCase(), label);
+  CTA_LOOKUP.set(label.toLocaleLowerCase("tr-TR"), label);
+}
+
+/** Match a single line against the CTA catalogue, case-insensitively. */
+export function matchCtaLine(line: string): string | null {
+  const t = line.trim();
+  if (!t || t.length > 40) return null;
+  return CTA_LOOKUP.get(t.toLowerCase()) ?? CTA_LOOKUP.get(t.toLocaleLowerCase("tr-TR")) ?? null;
+}
+
+// A line that is just a link-card domain (US.PUMA.COM, PLAY.GOOGLE.COM ...)
+const DOMAIN_LINE_RE = /^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}(\/\S*)?$/i;
+// A video scrubber line (0:00 / 0:06)
+const TIMESTAMP_LINE_RE = /^\d+:\d{2}\s*\/\s*\d+:\d{2}$/;
+// Card metadata lines that always end the caption
+const META_LINE_RES = [
+  /^library id\b/i,
+  /^kitaplık kimliği/i,
+  /^kimlik\s*:/i,
+  /^see ad details$/i,
+  /^see summary details$/i,
+  /^reklam ayrıntılarını gör$/i,
+  /^özet ayrıntılarını gör$/i,
+  /^this ad has multiple versions/i,
+  /^bu reklamın birden (çok|fazla) sürümü/i,
 ];
+
+/** Does this line terminate the primary text (caption)? */
+function isCaptionStopLine(line: string): boolean {
+  const t = line.trim();
+  if (!t) return false;
+  if (matchCtaLine(t)) return true;
+  if (DOMAIN_LINE_RE.test(t)) return true;
+  if (TIMESTAMP_LINE_RE.test(t)) return true;
+  return META_LINE_RES.some((re) => re.test(t));
+}
 
 const LIB_RE = /(?:Library ID|Kitaplık Kimliği|Kimlik)\s*:?\s*(\d{6,})/;
 const DATE_RE = /(?:Started running on|Yayınlanmaya başl[^\n:]*[:\s])\s*([^\n·]+)/i;
@@ -138,51 +172,56 @@ const DATE_RE = /(?:Started running on|Yayınlanmaya başl[^\n:]*[:\s])\s*([^\n�
 export function parseAdCardText(block: string, idx: number): Omit<AdData, "daysRunning" | "libraryUrl"> {
   const libMatch = block.match(LIB_RE);
   const dateMatch = block.match(DATE_RE);
+  const lines = block.split("\n");
 
-  // ── Caption: text after "Sponsored"/"Sponsorlu" up to first stop marker ──
-  let bodyText = "";
-  let captionStart = -1;
-  let captionEnd = -1;
-  const sponsoredMarkers = ["Sponsored\n", "Sponsorlu\n"];
-  for (const sm of sponsoredMarkers) {
-    const si = block.indexOf(sm);
-    if (si >= 0) {
-      captionStart = si + sm.length;
-      const after = block.substring(captionStart);
-      let cut = after.length;
-      for (const stop of STOP_MARKERS) {
-        const mi = after.indexOf(stop);
-        if (mi >= 0 && mi < cut) cut = mi;
-      }
-      bodyText = after.substring(0, cut).replace(/\n{3,}/g, "\n\n").trim();
-      captionEnd = captionStart + cut;
-      break;
+  // ── Caption: lines after the standalone "Sponsored"/"Sponsorlu" line, up to
+  //    the first stop line (CTA label, link-card domain, video scrubber,
+  //    or card metadata). Line-based matching is locale/case tolerant. ──
+  const sponsoredIdx = lines.findIndex((l) => {
+    const t = l.trim();
+    return t === "Sponsored" || t === "Sponsorlu";
+  });
+
+  let captionLines: string[] = [];
+  let afterCaption: string[] = [];
+  if (sponsoredIdx >= 0) {
+    let i = sponsoredIdx + 1;
+    for (; i < lines.length; i++) {
+      if (isCaptionStopLine(lines[i])) break;
+      captionLines.push(lines[i]);
     }
+    afterCaption = lines.slice(i);
   }
+  const bodyText = captionLines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 
-  // Everything except the caption — used for CTA & platform detection so that
-  // captions containing phrases like "Learn More" or "Facebook" can't pollute
-  // the stats.
-  const nonCaption =
-    captionStart >= 0 ? block.slice(0, captionStart) + block.slice(captionEnd) : block;
+  // Everything except the caption — for CTA & platform detection, so captions
+  // containing phrases like "Learn More" or "Facebook" can't pollute stats.
+  const beforeCaption = sponsoredIdx >= 0 ? lines.slice(0, sponsoredIdx + 1) : lines;
+  const nonCaptionLines = sponsoredIdx >= 0 ? [...beforeCaption, ...afterCaption] : lines;
 
-  let cta = "";
-  for (const pattern of CTA_PATTERNS) {
-    if (nonCaption.includes(pattern)) {
-      cta = pattern;
-      break;
+  // ── CTA: first catalogue match in the post-caption lines ──
+  let cta: string | null = null;
+  for (const line of afterCaption) {
+    cta = matchCtaLine(line);
+    if (cta) break;
+  }
+  if (!cta) {
+    for (const line of nonCaptionLines) {
+      cta = matchCtaLine(line);
+      if (cta) break;
     }
   }
   if (!cta) cta = "Belirsiz";
 
-  // ── Platforms ──
+  // ── Platforms: only what the text actually reveals. Meta renders platform
+  //    icons without names, so most cards yield none — we report that honestly
+  //    instead of fabricating a 50/50 Facebook/Instagram split. ──
+  const nonCaption = nonCaptionLines.join("\n");
   const platforms: string[] = [];
-  const metaSpace = nonCaption;
-  if (/Facebook/i.test(metaSpace)) platforms.push("Facebook");
-  if (/Instagram/i.test(metaSpace)) platforms.push("Instagram");
-  if (/Messenger/i.test(metaSpace)) platforms.push("Messenger");
-  if (/Audience Network/i.test(metaSpace)) platforms.push("Audience Network");
-  if (platforms.length === 0) platforms.push("Facebook", "Instagram");
+  if (/\bFacebook\b/i.test(nonCaption)) platforms.push("Facebook");
+  if (/\bInstagram\b/i.test(nonCaption)) platforms.push("Instagram");
+  if (/\bMessenger\b/i.test(nonCaption)) platforms.push("Messenger");
+  if (/\bAudience Network\b/i.test(nonCaption)) platforms.push("Audience Network");
 
   // ── Format ──
   const isVideo =
