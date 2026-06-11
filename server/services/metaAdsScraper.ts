@@ -320,14 +320,17 @@ export async function scrapeMetaAdsLibrary(
     const cardTexts: string[] = await page.evaluate((target: number) => {
       const libMarker = (t: string) =>
         t.includes("Library ID:") || t.includes("Kitaplık Kimliği");
-      const adMarker = (t: string) =>
-        t.includes("Sponsored") || t.includes("Sponsorlu") ||
-        t.includes("Started running on") || t.includes("Yayınlanmaya başl");
+      // "Sponsored" lives inside the ad-preview branch while Library ID lives
+      // in the metadata header branch — the deepest element containing BOTH is
+      // the full ad card. (Using the start-date as a marker was the v2 bug:
+      // the metadata strip alone contains Library ID + date, so the detector
+      // grabbed just the strip and lost captions + creatives.)
+      const adMarker = (t: string) => t.includes("Sponsored") || t.includes("Sponsorlu");
 
       const all = Array.from(document.querySelectorAll("div")) as HTMLElement[];
       const cands = all.filter((el) => {
         const t = el.innerText || "";
-        return t.length > 40 && t.length < 8000 && libMarker(t) && adMarker(t);
+        return t.length > 80 && t.length < 12000 && libMarker(t) && adMarker(t);
       });
       // deepest: a card has no candidate descendant
       const cards = cands.filter((el) => !cands.some((o) => o !== el && el.contains(o)));
@@ -340,7 +343,14 @@ export async function scrapeMetaAdsLibrary(
     let thumbnails: (string | undefined)[] = [];
 
     if (cardTexts.length > 0) {
+      console.log(`[Scraper] Card detection: ${cardTexts.length} cards for ${brandName}`);
       parsed = cardTexts.map((t, i) => parseAdCardText(t, i));
+      const emptyCaptions = parsed.filter((a) => a.body.startsWith("Ad ")).length;
+      if (emptyCaptions > parsed.length / 2) {
+        console.warn(
+          `[Scraper] WARNING: ${emptyCaptions}/${parsed.length} cards have no caption — Meta layout may have changed. First card text sample: ${JSON.stringify(cardTexts[0]?.slice(0, 400))}`
+        );
+      }
 
       // ── Thumbnails: clipped JPEG screenshots of each card, embedded as
       //    data-URIs so the report stays self-contained (fbcdn URLs expire) ──
@@ -350,6 +360,25 @@ export async function scrapeMetaAdsLibrary(
         let thumb: string | undefined;
         try {
           if (totalChars < MAX_TOTAL_THUMB_CHARS) {
+            // Bring the card into view and give lazy-loaded creatives a moment
+            await handles[i].evaluate((el) => el.scrollIntoView({ block: "center" }));
+            await new Promise((r) => setTimeout(r, 350));
+            await handles[i].evaluate(async (el) => {
+              const imgs = Array.from(el.querySelectorAll("img"));
+              await Promise.race([
+                Promise.all(
+                  imgs.map((im) =>
+                    (im as HTMLImageElement).complete
+                      ? Promise.resolve()
+                      : new Promise<void>((res) => {
+                          im.addEventListener("load", () => res(), { once: true });
+                          im.addEventListener("error", () => res(), { once: true });
+                        })
+                  )
+                ),
+                new Promise((res) => setTimeout(res, 1500)),
+              ]);
+            });
             const b64 = (await handles[i].screenshot({
               type: "jpeg",
               quality: 50,
