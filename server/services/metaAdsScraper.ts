@@ -3,18 +3,19 @@ import { execSync } from "child_process";
 import fs from "fs";
 
 // ─── How many ads to collect ──────────────────────────────────────────────────
-// Bumped from 10 → 20 per brand. Scroll count is derived from this target.
 export const TARGET_ADS = 20;
 
-// Resolve Chrome executable
-function findChrome(): string {
-  // 1. Environment variable (set in Docker / Railway)
+// Max size guards for embedded thumbnails (base64 chars)
+const MAX_THUMB_CHARS = 180_000; // ~135KB binary per thumbnail
+const MAX_TOTAL_THUMB_CHARS = 4_500_000; // ~3.4MB binary per brand
+
+export type ProgressFn = (scraped: number, target: number) => void;
+
+// Resolve Chrome executable (shared with the PDF route)
+export function findChrome(): string {
   if (process.env.PUPPETEER_EXECUTABLE_PATH && fs.existsSync(process.env.PUPPETEER_EXECUTABLE_PATH)) {
-    console.log(`[Scraper] Using PUPPETEER_EXECUTABLE_PATH: ${process.env.PUPPETEER_EXECUTABLE_PATH}`);
     return process.env.PUPPETEER_EXECUTABLE_PATH;
   }
-
-  // 2. Common system locations
   const candidates = [
     "/usr/lib/chromium/chromium",
     "/usr/bin/chromium",
@@ -23,18 +24,14 @@ function findChrome(): string {
     "/usr/bin/google-chrome",
   ];
   for (const p of candidates) {
-    if (fs.existsSync(p)) {
-      console.log(`[Scraper] Found Chrome at: ${p}`);
-      return p;
-    }
+    if (fs.existsSync(p)) return p;
   }
-
-  // 3. Try `which` as last resort
   try {
-    const result = execSync("which chromium || which chromium-browser || which google-chrome", { encoding: "utf8" }).trim();
+    const result = execSync("which chromium || which chromium-browser || which google-chrome", {
+      encoding: "utf8",
+    }).trim();
     if (result && fs.existsSync(result)) return result;
   } catch {}
-
   throw new Error("Chrome/Chromium not found. Set PUPPETEER_EXECUTABLE_PATH or install chromium.");
 }
 
@@ -48,14 +45,16 @@ export interface AdData {
   platforms: string[];
   format: string;
   libraryUrl: string;
+  /** Either a data-URI (Meta: embedded screenshot) or a remote URL (TikTok). */
+  thumbnail?: string;
 }
 
 export interface BrandAdsData {
   brandName: string;
   pageId: string;
-  source: "meta" | "tiktok"; // which ad library this came from
-  totalAds: number; // how many ads we actually scraped (ads.length)
-  reportedTotal: number | null; // total the library reports for this page (null if unknown)
+  source: "meta" | "tiktok";
+  totalAds: number;
+  reportedTotal: number | null;
   ads: AdData[];
   platformCounts: Record<string, number>;
   videoCount: number;
@@ -64,17 +63,46 @@ export interface BrandAdsData {
   monthlyTrend: Record<string, number>;
 }
 
-function parseDateToMs(dateStr: string): number {
-  // "20 Apr 2026", "11 Mar 2026", "17 Sep 2025"
-  const cleaned = dateStr.replace(/·.*$/, "").trim();
+// ─── Locale-tolerant date parsing (EN + TR) ───────────────────────────────────
+const MONTHS: Record<string, number> = {
+  jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
+  jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11,
+  // Turkish 3-letter (lowercased, Turkish chars preserved)
+  oca: 0, "şub": 1, sub: 1, nis: 3, haz: 5, tem: 6,
+  "ağu": 7, agu: 7, eyl: 8, eki: 9, kas: 10, ara: 11,
+  // "mar" and "may" overlap EN — already covered above
+};
+
+/**
+ * Parse Meta's start-date strings in both EN ("20 Apr 2026", "Apr 20, 2026")
+ * and TR ("20 Nis 2026") layouts. Returns null when unparseable instead of
+ * silently falling back to "now" (which used to corrupt trend stats).
+ */
+export function parseDateToMs(dateStr: string): number | null {
+  if (!dateStr) return null;
+  const cleaned = dateStr.replace(/·.*$/, "").replace(/,/g, " ").trim();
+
+  // "20 Apr 2026" / "20 Nis 2026"
+  let m = cleaned.match(/^(\d{1,2})\s+(\p{L}{3,})\s+(\d{4})$/u);
+  if (m) {
+    const mon = MONTHS[m[2].slice(0, 3).toLocaleLowerCase("tr-TR")] ?? MONTHS[m[2].slice(0, 3).toLowerCase()];
+    if (mon !== undefined) return Date.UTC(Number(m[3]), mon, Number(m[1]));
+  }
+  // "Apr 20 2026"
+  m = cleaned.match(/^(\p{L}{3,})\s+(\d{1,2})\s+(\d{4})$/u);
+  if (m) {
+    const mon = MONTHS[m[1].slice(0, 3).toLocaleLowerCase("tr-TR")] ?? MONTHS[m[1].slice(0, 3).toLowerCase()];
+    if (mon !== undefined) return Date.UTC(Number(m[3]), mon, Number(m[2]));
+  }
+  // Last resort: native parser (handles ISO etc.)
   const d = new Date(cleaned);
-  return isNaN(d.getTime()) ? Date.now() : d.getTime();
+  return isNaN(d.getTime()) ? null : d.getTime();
 }
 
 function daysSince(dateStr: string): number {
   const ms = parseDateToMs(dateStr);
-  const now = Date.now();
-  return Math.max(0, Math.floor((now - ms) / (1000 * 60 * 60 * 24)));
+  if (ms === null) return 0;
+  return Math.max(0, Math.floor((Date.now() - ms) / (1000 * 60 * 60 * 24)));
 }
 
 function extractPageId(url: string): string {
@@ -82,16 +110,149 @@ function extractPageId(url: string): string {
   return match ? match[1] : "";
 }
 
-export async function scrapeMetaAdsLibrary(url: string, brandName: string): Promise<BrandAdsData> {
+// ─── CTA catalogue (EN + TR labels as rendered by Meta) ───────────────────────
+const CTA_PATTERNS = [
+  "Shop Now", "Watch More", "Learn More", "Sign Up", "Book Now", "Download",
+  "Get Offer", "Contact Us", "Apply Now", "Subscribe", "Get Quote",
+  "Request Time", "See Menu", "Send Message", "Call Now", "Order Now",
+  "Get Directions", "Play Game",
+  // Turkish UI labels
+  "Şimdi satın al", "Alışveriş yap", "Daha fazla bilgi al", "Daha fazlasını izle",
+  "Kaydol", "Rezervasyon yap", "İndir", "Teklif al", "Bize ulaşın",
+  "Başvur", "Abone ol", "Fiyat teklifi al", "Menüye bak", "Mesaj gönder",
+  "Şimdi ara", "Sipariş ver", "Yol tarifi al",
+];
+
+// Markers that signal the end of the primary text (caption)
+const STOP_MARKERS = [
+  "\nLibrary ID:", "\nKitaplık Kimliği", "\nKimlik:",
+  "\nSee ad details", "\nSee summary details",
+  "\nReklam ayrıntılarını gör", "\nÖzet ayrıntılarını gör",
+  ...CTA_PATTERNS.map((c) => `\n${c}`),
+];
+
+const LIB_RE = /(?:Library ID|Kitaplık Kimliği|Kimlik)\s*:?\s*(\d{6,})/;
+const DATE_RE = /(?:Started running on|Yayınlanmaya başl[^\n:]*[:\s])\s*([^\n·]+)/i;
+
+/** Parse a single ad card's innerText into structured fields. */
+export function parseAdCardText(block: string, idx: number): Omit<AdData, "daysRunning" | "libraryUrl"> {
+  const libMatch = block.match(LIB_RE);
+  const dateMatch = block.match(DATE_RE);
+
+  // ── Caption: text after "Sponsored"/"Sponsorlu" up to first stop marker ──
+  let bodyText = "";
+  let captionStart = -1;
+  let captionEnd = -1;
+  const sponsoredMarkers = ["Sponsored\n", "Sponsorlu\n"];
+  for (const sm of sponsoredMarkers) {
+    const si = block.indexOf(sm);
+    if (si >= 0) {
+      captionStart = si + sm.length;
+      const after = block.substring(captionStart);
+      let cut = after.length;
+      for (const stop of STOP_MARKERS) {
+        const mi = after.indexOf(stop);
+        if (mi >= 0 && mi < cut) cut = mi;
+      }
+      bodyText = after.substring(0, cut).replace(/\n{3,}/g, "\n\n").trim();
+      captionEnd = captionStart + cut;
+      break;
+    }
+  }
+
+  // Everything except the caption — used for CTA & platform detection so that
+  // captions containing phrases like "Learn More" or "Facebook" can't pollute
+  // the stats.
+  const nonCaption =
+    captionStart >= 0 ? block.slice(0, captionStart) + block.slice(captionEnd) : block;
+
+  let cta = "";
+  for (const pattern of CTA_PATTERNS) {
+    if (nonCaption.includes(pattern)) {
+      cta = pattern;
+      break;
+    }
+  }
+  if (!cta) cta = "Belirsiz";
+
+  // ── Platforms ──
+  const platforms: string[] = [];
+  const metaSpace = nonCaption;
+  if (/Facebook/i.test(metaSpace)) platforms.push("Facebook");
+  if (/Instagram/i.test(metaSpace)) platforms.push("Instagram");
+  if (/Messenger/i.test(metaSpace)) platforms.push("Messenger");
+  if (/Audience Network/i.test(metaSpace)) platforms.push("Audience Network");
+  if (platforms.length === 0) platforms.push("Facebook", "Instagram");
+
+  // ── Format ──
+  const isVideo =
+    /\d+:\d{2}\s*\/\s*\d+:\d{2}/.test(block) ||
+    /Play Video/i.test(block) ||
+    /Videoyu oynat/i.test(block);
+  const format = isVideo ? "Video" : "Image/Carousel";
+
+  const libraryId = libMatch ? libMatch[1] : `unknown_${idx}`;
+  const startDate = dateMatch ? dateMatch[1].trim() : "";
+
+  return {
+    id: `ad_${idx}`,
+    libraryId,
+    body: bodyText || `Ad ${idx + 1}`,
+    startDate,
+    cta,
+    platforms,
+    format,
+  };
+}
+
+/** Aggregate per-ad data into brand-level stats. */
+export function aggregateBrandStats(ads: AdData[]) {
+  const platformCounts: Record<string, number> = {
+    Facebook: 0,
+    Instagram: 0,
+    Messenger: 0,
+    "Audience Network": 0,
+  };
+  ads.forEach((ad) => {
+    ad.platforms.forEach((p) => {
+      if (platformCounts[p] !== undefined) platformCounts[p]++;
+    });
+  });
+
+  const ctaCounts: Record<string, number> = {};
+  ads.forEach((ad) => {
+    ctaCounts[ad.cta] = (ctaCounts[ad.cta] || 0) + 1;
+  });
+
+  const videoCount = ads.filter((a) => a.format === "Video").length;
+  const staticCount = ads.length - videoCount;
+
+  const monthlyTrend: Record<string, number> = {};
+  ads.forEach((ad) => {
+    const ms = parseDateToMs(ad.startDate);
+    if (ms === null) return;
+    const d = new Date(ms);
+    const key = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+    monthlyTrend[key] = (monthlyTrend[key] || 0) + 1;
+  });
+
+  return { platformCounts, ctaCounts, videoCount, staticCount, monthlyTrend };
+}
+
+export async function scrapeMetaAdsLibrary(
+  url: string,
+  brandName: string,
+  onProgress?: ProgressFn
+): Promise<BrandAdsData> {
   const pageId = extractPageId(url);
   let browser;
 
   try {
     const chromePath = findChrome();
-    console.log(`[Scraper] Using Chrome: ${chromePath ?? "puppeteer default"}`);
+    console.log(`[Scraper] Using Chrome: ${chromePath}`);
     browser = await puppeteer.launch({
       headless: true,
-      ...(chromePath ? { executablePath: chromePath } : {}),
+      executablePath: chromePath,
       args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
     });
 
@@ -100,14 +261,16 @@ export async function scrapeMetaAdsLibrary(url: string, brandName: string): Prom
     await page.setUserAgent(
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     );
+    // Force English UI when possible so date/CTA parsing stays predictable;
+    // the parser still tolerates Turkish strings as a fallback.
+    await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9,tr;q=0.6" });
 
     console.log(`[Scraper] Loading: ${url}`);
     await page.goto(url, { waitUntil: "networkidle2", timeout: 60000 });
 
-    // ── Read the "~N results" total the library reports, before scrolling ──
+    // ── Reported total ("~N results" / "N sonuç") ──
     const reportedTotal = await page.evaluate(() => {
       const text = document.body.innerText;
-      // Meta shows e.g. "~250 results", "1,2K results", "About 320 results", or Turkish "≈250 sonuç"
       const patterns = [
         /~?\s*([\d.,]+)\s+results?/i,
         /([\d.,]+)\s+sonu[çc]/i,
@@ -124,7 +287,13 @@ export async function scrapeMetaAdsLibrary(url: string, brandName: string): Prom
     });
     console.log(`[Scraper] Reported total for ${brandName}: ${reportedTotal ?? "unknown"}`);
 
-    // ── Scroll until we have enough ad blocks (target 20) or run out ──
+    // ── Scroll until enough ads loaded ──
+    const countLoadedAds = () =>
+      page.evaluate(() => {
+        const t = document.body.innerText;
+        return (t.match(/Library ID:|Kitaplık Kimliği/g) || []).length;
+      });
+
     let lastCount = 0;
     let stagnant = 0;
     const maxScrolls = 14;
@@ -132,13 +301,10 @@ export async function scrapeMetaAdsLibrary(url: string, brandName: string): Prom
       await page.evaluate(() => window.scrollBy(0, 2500));
       await new Promise((r) => setTimeout(r, 1300));
 
-      const count = await page.evaluate(() => {
-        const blocks = document.body.innerText.split(/\n(?=Active\n)/);
-        return blocks.filter((b) => b.includes("Library ID:")).length;
-      });
+      const count = await countLoadedAds();
+      onProgress?.(Math.min(count, TARGET_ADS), TARGET_ADS);
 
       if (count >= TARGET_ADS) break;
-      // Stop early if scrolling no longer loads new ads (reached the end)
       if (count === lastCount) {
         stagnant++;
         if (stagnant >= 3) break;
@@ -148,159 +314,84 @@ export async function scrapeMetaAdsLibrary(url: string, brandName: string): Prom
       lastCount = count;
     }
 
-    // Extract all data via text parsing (most reliable approach)
-    const rawData = await page.evaluate((targetAds) => {
-      const text = document.body.innerText;
+    // ── Locate individual ad CARD elements (deepest containers holding both a
+    //    library-id marker and a sponsored/date marker), tag them, and return
+    //    their innerText. Card-level extraction keeps text↔thumbnail aligned. ──
+    const cardTexts: string[] = await page.evaluate((target: number) => {
+      const libMarker = (t: string) =>
+        t.includes("Library ID:") || t.includes("Kitaplık Kimliği");
+      const adMarker = (t: string) =>
+        t.includes("Sponsored") || t.includes("Sponsorlu") ||
+        t.includes("Started running on") || t.includes("Yayınlanmaya başl");
 
-      // Split by "Active" markers to get individual ad blocks
-      const blocks = text.split(/\n(?=Active\n)/);
-      const adBlocks = blocks.filter((b) => b.includes("Library ID:")).slice(0, targetAds);
-
-      const ads: any[] = [];
-      adBlocks.forEach((block, idx) => {
-        const libMatch = block.match(/Library ID:\s*(\d+)/);
-        const dateMatch = block.match(/Started running on\s+([^\n·]+)/);
-
-        // ── Full caption extraction ──
-        // After the "Sponsored" line, Meta renders the primary text (caption).
-        // Capture everything up to the first structural boundary instead of just one line.
-        let bodyText = "";
-        const sponsoredIdx = block.indexOf("Sponsored\n");
-        if (sponsoredIdx >= 0) {
-          const after = block.substring(sponsoredIdx + "Sponsored\n".length);
-          // Cut the caption at the first marker that signals the end of primary text.
-          const stopMarkers = [
-            "\nLibrary ID:",
-            "\nSee ad details",
-            "\nSee summary details",
-            "\nShop Now",
-            "\nLearn More",
-            "\nWatch More",
-            "\nSign Up",
-            "\nBook Now",
-            "\nDownload",
-            "\nGet Offer",
-            "\nContact Us",
-            "\nApply Now",
-            "\nSend Message",
-            "\nSee Menu",
-            "\nGet Quote",
-          ];
-          let cut = after.length;
-          for (const m of stopMarkers) {
-            const mi = after.indexOf(m);
-            if (mi >= 0 && mi < cut) cut = mi;
-          }
-          bodyText = after.substring(0, cut).trim();
-          // Collapse excessive blank lines but keep line breaks within the caption
-          bodyText = bodyText.replace(/\n{3,}/g, "\n\n").trim();
-        }
-
-        // Extract CTA - common Meta Ads CTAs
-        const ctaPatterns = [
-          "Shop Now",
-          "Watch More",
-          "Learn More",
-          "Sign Up",
-          "Book Now",
-          "Download",
-          "Get Offer",
-          "Contact Us",
-          "Apply Now",
-          "Subscribe",
-          "Get Quote",
-          "Request Time",
-          "See Menu",
-          "Send Message",
-          "Call Now",
-        ];
-        let cta = "";
-        for (const pattern of ctaPatterns) {
-          if (block.includes(pattern)) {
-            cta = pattern;
-            break;
-          }
-        }
-        // Mark unknown CTAs explicitly instead of silently defaulting to "Shop Now",
-        // which previously inflated the CTA stats.
-        if (!cta) cta = "Belirsiz";
-
-        // Detect platforms from platform icons text
-        const platforms: string[] = [];
-        if (block.includes("Facebook") || block.includes("facebook")) platforms.push("Facebook");
-        if (block.includes("Instagram") || block.includes("instagram")) platforms.push("Instagram");
-        if (block.includes("Messenger") || block.includes("messenger")) platforms.push("Messenger");
-        if (block.includes("Audience Network")) platforms.push("Audience Network");
-        // Default: assume Facebook + Instagram if no specific platform found
-        if (platforms.length === 0) {
-          platforms.push("Facebook", "Instagram");
-        }
-
-        // Detect format — video ads show a timestamp like "0:00 / 0:23" or have Play Video button hint
-        const isVideo =
-          /0:00\s*\/\s*\d+:\d+/.test(block) ||
-          block.includes("Play Video") ||
-          block.includes("play video");
-        const format = isVideo ? "Video" : "Image/Carousel";
-
-        const libraryId = libMatch ? libMatch[1] : `unknown_${idx}`;
-        const startDate = dateMatch ? dateMatch[1].trim() : "";
-
-        ads.push({
-          id: `ad_${idx}`,
-          libraryId,
-          body: bodyText || `Ad ${idx + 1}`,
-          startDate,
-          cta,
-          platforms,
-          format,
-        });
+      const all = Array.from(document.querySelectorAll("div")) as HTMLElement[];
+      const cands = all.filter((el) => {
+        const t = el.innerText || "";
+        return t.length > 40 && t.length < 8000 && libMarker(t) && adMarker(t);
       });
-
-      return ads;
+      // deepest: a card has no candidate descendant
+      const cards = cands.filter((el) => !cands.some((o) => o !== el && el.contains(o)));
+      const limited = cards.slice(0, target);
+      limited.forEach((el, i) => el.setAttribute("data-mar-card", String(i)));
+      return limited.map((el) => el.innerText || "");
     }, TARGET_ADS);
 
-    // Post-process: calculate days running, monthly trend, platform counts, CTA counts
-    const ads: AdData[] = rawData.map((ad: any) => ({
+    let parsed: ReturnType<typeof parseAdCardText>[] = [];
+    let thumbnails: (string | undefined)[] = [];
+
+    if (cardTexts.length > 0) {
+      parsed = cardTexts.map((t, i) => parseAdCardText(t, i));
+
+      // ── Thumbnails: clipped JPEG screenshots of each card, embedded as
+      //    data-URIs so the report stays self-contained (fbcdn URLs expire) ──
+      let totalChars = 0;
+      const handles = await page.$$("div[data-mar-card]");
+      for (let i = 0; i < handles.length; i++) {
+        let thumb: string | undefined;
+        try {
+          if (totalChars < MAX_TOTAL_THUMB_CHARS) {
+            const b64 = (await handles[i].screenshot({
+              type: "jpeg",
+              quality: 50,
+              encoding: "base64",
+            })) as string;
+            if (b64 && b64.length <= MAX_THUMB_CHARS) {
+              thumb = `data:image/jpeg;base64,${b64}`;
+              totalChars += b64.length;
+            }
+          }
+        } catch (e) {
+          console.warn(`[Scraper] Thumbnail failed for card ${i}:`, (e as Error).message);
+        }
+        thumbnails.push(thumb);
+      }
+    } else {
+      // ── Fallback: legacy whole-page innerText split (no thumbnails) ──
+      console.warn("[Scraper] Card detection found 0 cards — falling back to text split");
+      const blocks: string[] = await page.evaluate((target: number) => {
+        const text = document.body.innerText;
+        const parts = text.split(/\n(?=(?:Active|Aktif)\n)/);
+        return parts
+          .filter((b) => b.includes("Library ID:") || b.includes("Kitaplık Kimliği"))
+          .slice(0, target);
+      }, TARGET_ADS);
+      parsed = blocks.map((b, i) => parseAdCardText(b, i));
+      thumbnails = blocks.map(() => undefined);
+    }
+
+    await browser.close();
+    browser = undefined;
+
+    const ads: AdData[] = parsed.map((ad, i) => ({
       ...ad,
       daysRunning: daysSince(ad.startDate),
       libraryUrl: `https://www.facebook.com/ads/library/?id=${ad.libraryId}`,
+      ...(thumbnails[i] ? { thumbnail: thumbnails[i] } : {}),
     }));
 
-    // Platform counts
-    const platformCounts: Record<string, number> = {
-      Facebook: 0,
-      Instagram: 0,
-      Messenger: 0,
-      "Audience Network": 0,
-    };
-    ads.forEach((ad) => {
-      ad.platforms.forEach((p) => {
-        if (platformCounts[p] !== undefined) platformCounts[p]++;
-      });
-    });
+    onProgress?.(ads.length, TARGET_ADS);
 
-    // CTA counts
-    const ctaCounts: Record<string, number> = {};
-    ads.forEach((ad) => {
-      ctaCounts[ad.cta] = (ctaCounts[ad.cta] || 0) + 1;
-    });
-
-    // Format counts
-    const videoCount = ads.filter((a) => a.format === "Video").length;
-    const staticCount = ads.length - videoCount;
-
-    // Monthly trend (ads started per month)
-    const monthlyTrend: Record<string, number> = {};
-    ads.forEach((ad) => {
-      if (!ad.startDate) return;
-      const d = new Date(parseDateToMs(ad.startDate));
-      if (isNaN(d.getTime())) return;
-      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
-      monthlyTrend[key] = (monthlyTrend[key] || 0) + 1;
-    });
-
-    await browser.close();
+    const stats = aggregateBrandStats(ads);
 
     return {
       brandName,
@@ -309,15 +400,11 @@ export async function scrapeMetaAdsLibrary(url: string, brandName: string): Prom
       totalAds: ads.length,
       reportedTotal,
       ads,
-      platformCounts,
-      videoCount,
-      staticCount,
-      ctaCounts,
-      monthlyTrend,
+      ...stats,
     };
   } catch (error) {
     console.error("[Scraper] Error:", error);
-    if (browser) await browser.close();
+    if (browser) await browser.close().catch(() => {});
     throw error;
   }
 }

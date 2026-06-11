@@ -81,3 +81,38 @@ pnpm dev
 ```
 
 Not: Lokal geliştirme için Chrome/Chromium yüklü olmalıdır.
+
+
+---
+
+## v2 Güncellemesi (Haziran 2026)
+
+### Yeni özellikler
+- **Job kuyruğu + canlı ilerleme:** Rapor oluşturma artık kuyruk üzerinden çalışır; arayüzde marka bazlı ilerleme çubuğu gösterilir. Aynı anda tek scrape çalışır (RAM güvenliği + doğal rate limit).
+- **Kreatif thumbnail'ları:** Meta reklam kartlarının ekran görüntüsü (JPEG, data-URI) rapora gömülür — fbcdn URL'leri zamanla ölse de rapor bozulmaz. TikTok'ta kütüphanenin kendi thumbnail URL'i kullanılır.
+- **AI içgörü katmanı:** `ANTHROPIC_API_KEY` tanımlıysa her rapor için Claude ile açı/hook analizi, temel bulgular ve stratejik öneriler üretilir (Öneriler sekmesi + üstte AI özeti). Key yoksa rapor normal şekilde, AI bloğu olmadan oluşur.
+- **PDF export:** Rapor sayfasındaki "PDF" butonu `GET /api/report-pdf/:token` ile A4 PDF üretir (mevcut Chromium kullanılır, ek bağımlılık yok).
+- **OG meta tag'leri:** Paylaşılan `/report/:token` linkleri Slack/WhatsApp'ta başlıklı önizleme ile açılır.
+- **Güvenlik:** Scrape URL'leri sunucu tarafında facebook.com / library.tiktok.com ile sınırlandı (SSRF koruması). TR/EN locale tarih parsing düzeltildi; tek marka hatası artık tüm raporu düşürmez.
+
+### Ortam değişkenleri
+| Değişken | Zorunlu | Açıklama |
+|---|---|---|
+| `DATABASE_URL` | Evet | Railway MySQL bağlantısı |
+| `PUPPETEER_EXECUTABLE_PATH` | Hayır | Dockerfile'da `/usr/bin/chromium` olarak set ediliyor |
+| `ANTHROPIC_API_KEY` | Hayır | AI içgörüleri için. Yoksa rapor AI'sız oluşur |
+| `INSIGHTS_MODEL` | Hayır | Varsayılan: `claude-sonnet-4-6` |
+
+### Yeniden deploy
+```bash
+git add .
+git commit -m "v2: thumbnails, AI insights, job queue, PDF export"
+git push
+```
+Railway push'u algılayıp Dockerfile ile otomatik build alır. Sonrasında ana servisin **Variables** sekmesine `ANTHROPIC_API_KEY` ekleyin (eklediğiniz anda servis yeniden başlar).
+
+### Deploy sonrası doğrulama
+1. `/` → 1 markayla rapor başlat, ilerleme çubuğunun aktığını gör.
+2. Rapor açıldığında **Örnekler** sekmesinde thumbnail'lar görünüyor mu? (Görünmüyorsa Railway loglarında `[Scraper] Card detection found 0 cards` uyarısını ara — Meta layout değişmiş demektir, eski metin-parse yoluna düşer ama rapor yine oluşur.)
+3. **Öneriler** sekmesinde AI analizi var mı? (Yoksa loglarda `[Insights]` satırlarına bak.)
+4. **PDF** butonunu test et — ilk PDF ~10-15 sn sürebilir.

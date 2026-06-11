@@ -1,0 +1,130 @@
+import { nanoid } from "nanoid";
+import { createReport } from "../db";
+import { scrapeMetaAdsLibrary, TARGET_ADS, type BrandAdsData, type ProgressFn } from "./metaAdsScraper";
+import { scrapeTikTokAdsLibrary } from "./tiktokAdsScraper";
+import { generateInsights } from "./adInsights";
+
+export interface BrandInput {
+  name: string;
+  url: string;
+  color: string;
+  source: "meta" | "tiktok";
+}
+
+export interface RunReportInput {
+  brands: BrandInput[];
+  reportName?: string;
+}
+
+export interface RunReportHooks {
+  onBrandStart?: (index: number) => void;
+  onBrandProgress?: (index: number, scraped: number, target: number) => void;
+  onBrandDone?: (index: number, adsCount: number) => void;
+  onBrandError?: (index: number, error: string) => void;
+  onPhase?: (phase: "scrape" | "insights" | "save") => void;
+}
+
+export interface RunReportResult {
+  success: true;
+  shareToken: string;
+  reportName: string;
+  brands: {
+    name: string;
+    adsCount: number;
+    reportedTotal: number | null;
+    source: "meta" | "tiktok" | undefined;
+  }[];
+  failed: { name: string; error: string }[];
+}
+
+/**
+ * Shared report pipeline used by both the synchronous tRPC mutation (legacy)
+ * and the job queue. Brands are scraped SEQUENTIALLY — one Chrome instance at
+ * a time — to keep memory bounded on small Railway instances. A single brand
+ * failure no longer kills the whole report: partial reports are created as
+ * long as at least one brand succeeds.
+ */
+export async function runReport(
+  input: RunReportInput,
+  hooks: RunReportHooks = {}
+): Promise<RunReportResult> {
+  hooks.onPhase?.("scrape");
+
+  const results: (BrandAdsData | null)[] = [];
+  const failed: { name: string; error: string }[] = [];
+
+  for (let i = 0; i < input.brands.length; i++) {
+    const brand = input.brands[i];
+    hooks.onBrandStart?.(i);
+    const onProgress: ProgressFn = (scraped, target) =>
+      hooks.onBrandProgress?.(i, scraped, target);
+    try {
+      const data =
+        brand.source === "tiktok"
+          ? await scrapeTikTokAdsLibrary(brand.url, brand.name, onProgress)
+          : await scrapeMetaAdsLibrary(brand.url, brand.name, onProgress);
+      results.push(data);
+      hooks.onBrandDone?.(i, data.totalAds);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : "Unknown error";
+      console.error(`[ReportRunner] Brand "${brand.name}" failed:`, msg);
+      results.push(null);
+      failed.push({ name: brand.name, error: msg });
+      hooks.onBrandError?.(i, msg);
+    }
+  }
+
+  const succeeded = results
+    .map((r, i) => ({ r, brand: input.brands[i] }))
+    .filter((x): x is { r: BrandAdsData; brand: BrandInput } => x.r !== null);
+
+  if (succeeded.length === 0) {
+    throw new Error(
+      `Hiçbir marka analiz edilemedi. ${failed.map((f) => `${f.name}: ${f.error}`).join(" | ")}`
+    );
+  }
+
+  // ── AI insight layer (optional, never blocks report creation) ──
+  hooks.onPhase?.("insights");
+  const insights = await generateInsights(succeeded.map((s) => s.r)).catch(() => null);
+
+  // ── Persist ──
+  hooks.onPhase?.("save");
+  const shareToken = nanoid(32);
+  const brandNames = input.brands.map((b) => b.name).join(", ");
+  const reportName = input.reportName || `${brandNames} Raporu`;
+
+  const reportData: Record<string, any> = {};
+  succeeded.forEach(({ r, brand }) => {
+    reportData[brand.name] = {
+      name: brand.name,
+      color: brand.color,
+      url: brand.url,
+      ...r,
+    };
+  });
+  if (insights) reportData.__insights = insights;
+
+  await createReport({
+    userId: 0,
+    shareToken,
+    reportName,
+    brandCount: succeeded.length,
+    reportData: reportData as any,
+  });
+
+  return {
+    success: true,
+    shareToken,
+    reportName,
+    brands: succeeded.map(({ r }) => ({
+      name: r.brandName,
+      adsCount: r.totalAds,
+      reportedTotal: r.reportedTotal ?? null,
+      source: r.source,
+    })),
+    failed,
+  };
+}
+
+export { TARGET_ADS };

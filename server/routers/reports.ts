@@ -1,73 +1,70 @@
 import { z } from "zod";
 import { publicProcedure, router } from "../_core/trpc";
-import { createReport, getReportByShareToken, deleteReport } from "../db";
-import { scrapeMetaAdsLibrary } from "../services/metaAdsScraper";
-import { scrapeTikTokAdsLibrary } from "../services/tiktokAdsScraper";
-import { nanoid } from "nanoid";
+import { getReportByShareToken, deleteReport } from "../db";
+import { runReport } from "../services/reportRunner";
+import { enqueueScrapeJob, getJob } from "../services/jobQueue";
+
+/**
+ * Server-side host validation (SSRF guard).
+ *
+ * The scraper drives a real headless Chrome from inside the container, so the
+ * target URL must be restricted to the two ad libraries — otherwise a public
+ * caller could point the browser at internal network addresses. Client-side
+ * checks alone are not enough; tRPC can be called directly.
+ */
+function isAllowedHost(rawUrl: string, source: "meta" | "tiktok"): boolean {
+  try {
+    const u = new URL(rawUrl);
+    if (u.protocol !== "https:") return false;
+    const host = u.hostname.toLowerCase();
+    if (source === "tiktok") return host === "library.tiktok.com";
+    return host === "facebook.com" || host.endsWith(".facebook.com");
+  } catch {
+    return false;
+  }
+}
+
+const brandInputSchema = z
+  .object({
+    name: z.string().min(1).max(255),
+    url: z.string().url(),
+    color: z.string().regex(/^#[0-9A-F]{6}$/i),
+    source: z.enum(["meta", "tiktok"]).default("meta"),
+  })
+  .refine((b) => isAllowedHost(b.url, b.source), {
+    message:
+      "URL yalnızca facebook.com/ads/library veya library.tiktok.com adreslerinden olabilir",
+    path: ["url"],
+  });
+
+const scrapeInputSchema = z.object({
+  brands: z.array(brandInputSchema).min(1).max(3),
+  reportName: z.string().min(1).max(255).optional(),
+});
 
 export const reportsRouter = router({
-  // Scrape multiple brands and create a single combined report (public)
+  // ── Job-based flow (preferred): enqueue, then poll jobStatus ──────────────
+  startScrapeJob: publicProcedure
+    .input(scrapeInputSchema)
+    .mutation(async ({ input }) => {
+      return enqueueScrapeJob(input);
+    }),
+
+  jobStatus: publicProcedure
+    .input(z.object({ jobId: z.string().min(1).max(64) }))
+    .query(async ({ input }) => {
+      const job = getJob(input.jobId);
+      if (!job) throw new Error("İş bulunamadı (süresi dolmuş olabilir)");
+      return job;
+    }),
+
+  // ── Legacy synchronous flow (kept for compatibility) ──────────────────────
   scrapeAndCreateMulti: publicProcedure
-    .input(
-      z.object({
-        brands: z.array(
-          z.object({
-            name: z.string().min(1).max(255),
-            url: z.string().url(),
-            color: z.string().regex(/^#[0-9A-F]{6}$/i),
-            // Which ad library this URL points to. Defaults to meta for
-            // backward compatibility with existing clients.
-            source: z.enum(["meta", "tiktok"]).default("meta"),
-          })
-        ).min(1).max(3),
-        reportName: z.string().min(1).max(255).optional(),
-      })
-    )
+    .input(scrapeInputSchema)
     .mutation(async ({ input }) => {
       try {
-        // Scrape all brands in parallel, routing to the correct scraper.
-        const results = await Promise.all(
-          input.brands.map((brand) =>
-            brand.source === "tiktok"
-              ? scrapeTikTokAdsLibrary(brand.url, brand.name)
-              : scrapeMetaAdsLibrary(brand.url, brand.name)
-          )
-        );
-
-        const shareToken = nanoid(32);
-        const brandNames = input.brands.map((b) => b.name).join(", ");
-        const reportName = input.reportName || `${brandNames} Raporu`;
-
-        // Build report data keyed by brand name
-        const reportData: Record<string, any> = {};
-        input.brands.forEach((brand, idx) => {
-          reportData[brand.name] = {
-            name: brand.name,
-            color: brand.color,
-            url: brand.url,
-            ...results[idx],
-          };
-        });
-
-        await createReport({
-          userId: 0, // anonymous — no login required
-          shareToken,
-          reportName,
-          brandCount: input.brands.length,
-          reportData: reportData as any,
-        });
-
-        return {
-          success: true,
-          shareToken,
-          reportName,
-          brands: results.map((r) => ({
-            name: r.brandName,
-            adsCount: r.totalAds,
-            reportedTotal: r.reportedTotal,
-            source: r.source,
-          })),
-        };
+        const result = await runReport(input);
+        return result;
       } catch (error) {
         console.error("[Reports] Scrape error:", error);
         throw new Error(
@@ -94,7 +91,7 @@ export const reportsRouter = router({
       return await getReportByShareToken(input);
     }),
 
-  // Delete a report by shareToken (no auth — token acts as ownership proof)
+  // Delete a report by shareToken (token acts as ownership proof)
   delete: publicProcedure
     .input(z.object({ shareToken: z.string() }))
     .mutation(async ({ input }) => {

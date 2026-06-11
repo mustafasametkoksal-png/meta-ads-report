@@ -2,7 +2,7 @@ import { useState, useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import { Loader2, Plus, Trash2, Copy, ExternalLink, BarChart2 } from "lucide-react";
+import { Loader2, Plus, Trash2, Copy, ExternalLink, BarChart2, CheckCircle2, XCircle, Clock } from "lucide-react";
 import { trpc } from "@/lib/trpc";
 import { toast } from "sonner";
 
@@ -47,20 +47,49 @@ export default function DynamicReport() {
     { enabled: savedTokens.length > 0 }
   );
 
-  const scrapeAndCreateMutation = trpc.reports.scrapeAndCreateMulti.useMutation({
-    onSuccess: (data) => {
-      saveToken(data.shareToken);
-      setSavedTokens(getSavedTokens());
-      setTimeout(() => refetchReports(), 300);
-      toast.success(
-        `Rapor oluşturuldu! ${data.brands.map((b) => `${b.name}: ${b.adsCount} reklam`).join(", ")}`
-      );
-      setBrands([{ name: "", url: "", color: BRAND_COLORS[0], source: "meta" }]);
-    },
+  const [activeJobId, setActiveJobId] = useState<string | null>(null);
+
+  const startJobMutation = trpc.reports.startScrapeJob.useMutation({
+    onSuccess: (data) => setActiveJobId(data.jobId),
     onError: (err) => {
       toast.error(`Hata: ${err.message}`);
+      setIsCreating(false);
     },
   });
+
+  const { data: job } = trpc.reports.jobStatus.useQuery(
+    { jobId: activeJobId ?? "" },
+    { enabled: !!activeJobId, refetchInterval: 1500 }
+  );
+
+  useEffect(() => {
+    if (!job) return;
+    if (job.status === "done" && job.shareToken) {
+      saveToken(job.shareToken);
+      setSavedTokens(getSavedTokens());
+      setTimeout(() => refetchReports(), 300);
+      const summary = job.brands
+        .filter((b) => b.status === "done")
+        .map((b) => `${b.name}: ${b.adsCount ?? 0} reklam`)
+        .join(", ");
+      toast.success(`Rapor oluşturuldu! ${summary}`);
+      const failedBrands = job.brands.filter((b) => b.status === "error");
+      if (failedBrands.length > 0) {
+        toast.warning(
+          `Bazı markalar analiz edilemedi: ${failedBrands.map((b) => b.name).join(", ")}`
+        );
+      }
+      setBrands([{ name: "", url: "", color: BRAND_COLORS[0], source: "meta" }]);
+      setActiveJobId(null);
+      setIsCreating(false);
+      window.open(`/report/${job.shareToken}`, "_blank");
+    } else if (job.status === "error") {
+      toast.error(`Hata: ${job.error ?? "Bilinmeyen hata"}`);
+      setActiveJobId(null);
+      setIsCreating(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [job?.status, job?.shareToken]);
 
   const deleteReportMutation = trpc.reports.delete.useMutation({
     onSuccess: (_, variables) => {
@@ -112,11 +141,7 @@ export default function DynamicReport() {
       }
     }
     setIsCreating(true);
-    try {
-      await scrapeAndCreateMutation.mutateAsync({ brands });
-    } finally {
-      setIsCreating(false);
-    }
+    startJobMutation.mutate({ brands });
   };
 
   const handleCopyShareLink = (shareToken: string) => {
@@ -262,13 +287,66 @@ export default function DynamicReport() {
                 {isCreating ? (
                   <>
                     <Loader2 className="w-4 h-4 animate-spin" />
-                    Analiz ediliyor... (bu işlem 1-2 dakika sürebilir)
+                    Analiz ediliyor...
                   </>
                 ) : (
                   "Rapor Oluştur"
                 )}
               </Button>
             </div>
+
+            {/* Live job progress */}
+            {activeJobId && job && (
+              <div className="rounded-lg border border-emerald-200 bg-emerald-50/50 p-4 space-y-2.5">
+                {job.status === "queued" && (
+                  <p className="text-xs text-slate-600 flex items-center gap-1.5">
+                    <Clock className="w-3.5 h-3.5" />
+                    Sırada bekleniyor{job.queuePosition ? ` (sıra: ${job.queuePosition})` : ""}...
+                  </p>
+                )}
+                {job.brands.map((b) => (
+                  <div key={b.name} className="flex items-center gap-2.5">
+                    {b.status === "done" ? (
+                      <CheckCircle2 className="w-4 h-4 text-emerald-500 shrink-0" />
+                    ) : b.status === "error" ? (
+                      <XCircle className="w-4 h-4 text-red-500 shrink-0" />
+                    ) : b.status === "running" ? (
+                      <Loader2 className="w-4 h-4 animate-spin text-emerald-500 shrink-0" />
+                    ) : (
+                      <Clock className="w-4 h-4 text-slate-300 shrink-0" />
+                    )}
+                    <span className="text-sm font-medium text-slate-700 w-32 truncate">{b.name}</span>
+                    <div className="flex-1 h-1.5 bg-slate-200 rounded-full overflow-hidden">
+                      <div
+                        className={`h-full rounded-full transition-all duration-700 ${
+                          b.status === "error" ? "bg-red-400" : "bg-emerald-500"
+                        }`}
+                        style={{
+                          width: `${
+                            b.status === "done"
+                              ? 100
+                              : Math.min(95, Math.round(((b.scraped || 0) / (b.target || 20)) * 100))
+                          }%`,
+                        }}
+                      />
+                    </div>
+                    <span className="text-xs text-slate-500 w-14 text-right tabular-nums">
+                      {b.status === "done"
+                        ? `${b.adsCount ?? 0} reklam`
+                        : b.status === "error"
+                        ? "hata"
+                        : `${b.scraped || 0}/${b.target || 20}`}
+                    </span>
+                  </div>
+                ))}
+                {job.status === "running" && job.phase === "insights" && (
+                  <p className="text-xs text-slate-600 flex items-center gap-1.5 pt-1 border-t border-emerald-100">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    AI içgörüleri üretiliyor...
+                  </p>
+                )}
+              </div>
+            )}
           </CardContent>
         </Card>
 

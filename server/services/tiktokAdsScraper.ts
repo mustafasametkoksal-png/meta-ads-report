@@ -2,7 +2,7 @@ import puppeteer from "puppeteer";
 import { execSync } from "child_process";
 import fs from "fs";
 import type { AdData, BrandAdsData } from "./metaAdsScraper";
-import { TARGET_ADS } from "./metaAdsScraper";
+import { TARGET_ADS, type ProgressFn } from "./metaAdsScraper";
 
 /**
  * TikTok Commercial Content Library scraper.
@@ -81,6 +81,7 @@ interface RawTikTokAd {
   isVideo: boolean;
   first: number | null; // epoch ms
   last: number | null; // epoch ms
+  image: string | null; // first thumbnail URL from the library API
 }
 
 function daysSinceMs(ms: number | null): number {
@@ -96,7 +97,11 @@ function msToDateString(ms: number | null): string {
   return d.toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
 }
 
-export async function scrapeTikTokAdsLibrary(url: string, brandName: string): Promise<BrandAdsData> {
+export async function scrapeTikTokAdsLibrary(
+  url: string,
+  brandName: string,
+  onProgress?: ProgressFn
+): Promise<BrandAdsData> {
   const pageId = extractTikTokId(url);
   let browser;
 
@@ -142,6 +147,7 @@ export async function scrapeTikTokAdsLibrary(url: string, brandName: string): Pr
                     isVideo: Array.isArray(d.videos) && d.videos.length > 0,
                     first: d.first_shown_date || null,
                     last: d.last_shown_date || null,
+                    image: Array.isArray(d.image_urls) && d.image_urls.length > 0 ? d.image_urls[0] : null,
                   };
                 });
                 if (typeof j.total === "number") (window as any).__ttTotal = j.total;
@@ -165,6 +171,7 @@ export async function scrapeTikTokAdsLibrary(url: string, brandName: string): Pr
     let stagnant = 0;
     for (let i = 0; i < 6; i++) {
       const count = await page.evaluate(() => Object.keys((window as any).__ttAds || {}).length);
+      onProgress?.(Math.min(count, TARGET_ADS), TARGET_ADS);
       if (count >= TARGET_ADS) break;
 
       const clicked = await page.evaluate(() => {
@@ -209,7 +216,10 @@ export async function scrapeTikTokAdsLibrary(url: string, brandName: string): Pr
       platforms: ["TikTok"],
       format: ad.isVideo ? "Video" : "Image/Carousel",
       libraryUrl: `https://library.tiktok.com/ads/detail/?ad_id=${ad.id}`,
+      ...(ad.image ? { thumbnail: ad.image } : {}),
     }));
+
+    onProgress?.(ads.length, TARGET_ADS);
 
     const platformCounts: Record<string, number> = {
       TikTok: ads.length,
